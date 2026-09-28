@@ -63,3 +63,4 @@
 - [`runtime-internals.md`](./runtime-internals.md) —— 运行时内部细节：目录结构、环境变量、启动命令、数据卷（敏感值已脱敏）
 - [`architect-notes.md`](./architect-notes.md) —— 架构师视角：8 个值得关注的维度（handoff 世代机制、Postgres 第三存储、四层挂载、安全边界、零信任网络、可观测性、成本、发布）+ 未解之谜清单
 - [`demo/`](./demo/) —— 最小可跑复刻：`orchestrator.sh`（编排器）+ `guest/agent-loop.sh`（最小 agent）+ `checkpoint.sh`（世代交接），Linux 上 `sudo ./orchestrator.sh "你好"` 即跑
+- [`production-architecture.md`](./production-architecture.md) —— 生产级架构：墙外的另一半（调度器、VM 池、spawnd、镜像管线、CA/身份、网络平面、数据平面、handoff 编排、推理平面、可观测性、安全平面），严格区分实测痕迹 / 强推断 / 设计推演
