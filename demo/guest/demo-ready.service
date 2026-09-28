@@ -1,0 +1,14 @@
+[Unit]
+# demo-ready.service — 容器内 oneshot 单元
+# 对标真实架构：hatch-ca-trust.service（一句话：启动时干完一件事）+
+#              runtime-cell.ready（就绪标记，宿主机侧轮询它）
+Description=demo: write ready marker after boot
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -c 'mkdir -p /run/demo && date -u +%%FT%%TZ > /run/demo/ready && echo demo-cell-ready'
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
