@@ -60,3 +60,4 @@
 ## 相关文件
 
 - [`pseudocode.md`](./pseudocode.md) —— 基于本报告的云服务生命周期伪代码
+- [`runtime-internals.md`](./runtime-internals.md) —— 运行时内部细节：目录结构、环境变量、启动命令、数据卷（敏感值已脱敏）
