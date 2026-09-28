@@ -62,3 +62,4 @@
 - [`pseudocode.md`](./pseudocode.md) —— 基于本报告的云服务生命周期伪代码
 - [`runtime-internals.md`](./runtime-internals.md) —— 运行时内部细节：目录结构、环境变量、启动命令、数据卷（敏感值已脱敏）
 - [`architect-notes.md`](./architect-notes.md) —— 架构师视角：8 个值得关注的维度（handoff 世代机制、Postgres 第三存储、四层挂载、安全边界、零信任网络、可观测性、成本、发布）+ 未解之谜清单
+- [`demo/`](./demo/) —— 最小可跑复刻：`orchestrator.sh`（编排器）+ `guest/agent-loop.sh`（最小 agent）+ `checkpoint.sh`（世代交接），Linux 上 `sudo ./orchestrator.sh "你好"` 即跑
