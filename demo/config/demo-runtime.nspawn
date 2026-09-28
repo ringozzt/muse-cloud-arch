@@ -1,0 +1,16 @@
+# demo-runtime.nspawn — nspawn 配置模板（@DEMO_DIR@ 由 orchestrator.sh 渲染）
+# 对标真实架构：宿主机以类似 pre-start.sh 的方式组织容器的挂载与网络。
+[Exec]
+Boot=yes
+
+[Files]
+# 持久 home（对标 /dev/mapper/rv btrfs 独立挂载；demo 用宿主机目录 + bind 简化）
+Bind=/var/lib/demo/home:/home/demo
+# run 共享目录：ready 标记、inbox、epoch、快照（对标 /run/hatch 总线）
+Bind=/var/lib/demo/run:/run/demo
+# guest 脚本只读（对标 "the cell cannot edit it"）
+BindReadOnly=@DEMO_DIR@/guest:/guest
+
+[Network]
+# veth 网卡（对标 ve-htch-runtime；容器得网关 IP，mock 模式下其实用不到外网）
+VirtualEthernet=yes
