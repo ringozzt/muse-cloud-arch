@@ -36,6 +36,33 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 > `NET_ADMIN` / `SYS_ADMIN` 仍在。最可能的解释是**不同进程的 cap 集合不同**
 > （daemon 主进程 vs 派生的 exec），或博客为简化表述。`SYS_PTRACE` 被去是双方一致的。
 
+### 官方架构图
+
+![Muse 安全架构官方图](assets/security-architecture.png)
+
+上图为官方安全架构图（Excalidraw 风格原图已收录为 `assets/security-architecture.png`）。
+图的精华不在框，而在**三条线**：
+
+1. **红字是题眼**：cell 与宿主机服务之间的一切通信走 `Unix domain sockets w/ SO_PEERCRED + PeerACL` ——
+   内核认证的 IPC，没有秘密可偷。这是整张图唯一用红色写的字。
+2. **颜色即信任边界**：绿色 = 用户侧/不可信数据区（Runtime cell 处理不可信输入），
+   紫色 = 宿主机可信服务，橙色 = 外部。安全故事就是"哪个框能碰哪个框"。
+3. **Sentinel 是唯一的粗框**：标签最多（connector policy、L4/L7 approvals + grants、SSRF validation、
+   TLS inspection、credential insertion）—— 所有向外的路都收敛到它。
+   蓝色箭头从 `Approvals` 直连 `Sentinel`，表示人工审批**绕过 agent**，直达决策点。
+
+图中带来的**新增信息**（此前未记录）：
+
+| 新增点 | 说明 | 与实测的互证 |
+|---|---|---|
+| Ingress = TLS + **Noise** | 客户端↔VM 传输层用 Noise 协议 | 首次得知 |
+| 持久存储 = **LUKS 加密** | `Persistent Storage → LUKS Encryption → filesystem mount` | ✅ 互证！`/dev/mapper/rv` 的 device-mapper 命名正是 LUKS 卷的典型形态 |
+| **rootful guest** | cell 内有 root，但 `guest root != host root`，且 `no host secrets, no Sentinel state` | 修正：靠 user namespace + ACL 做隔离，而非去 root 化 |
+| execd sandbox：seccomp w/filters | exec 沙箱的 seccomp 是带过滤器的 | 与实测 `Seccomp=2` 一致 |
+| Credential Capture UI | 客户端内的凭证采集 UI，凭证直达 authd | 与 Secure Vault 流程对应 |
+| telemetry proxy → Product Systems | 遥测去向：health / audit / analytics | 首次得知 |
+| hatch-safety → Inference proxy | 分类器坐在推理路径上 | 与 §2.11 互证 |
+
 ## 1. 完整架构图
 
 ```
@@ -137,6 +164,8 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 
 - ✅ 痕迹：`/dev/mapper/rv` btrfs（`zstd:3` 压缩）；hotset 条目指向 `/var/lib/hatch/postgres`；`postgres_system_identifier`；`pg-clean.proof`；`~/.hatch-db-change-signals/`。
 - 🔍 强推断：数据面至少两部分 —— btrfs 卷（用户文件，跨容器世代持久）+ Postgres（结构化运行时状态，跑在宿主机侧，handoff 时做一致性校验）。两者都在"墙外"供应、"墙内"使用。
+- ✅ 官方确认（架构图）：持久存储层为 **LUKS 加密**（`Persistent Storage → LUKS Encryption → filesystem mount`）。
+  这解释了实测中 `/dev/mapper/rv` 的命名 —— device-mapper 正是 LUKS 卷的典型形态。静态数据加密在块设备层完成，对容器透明。
 - 💭 生产级要点：
   - btrfs 选型理由：子卷（天然按用户隔离）、快照（handoff/备份）、zstd 压缩（降成本）。
   - Postgres 存的应该是**高频、小粒度的运行时状态**（记忆索引、会话、spaces catalog），文件存**低频、大粒度**的用户数据 —— 经典的冷热分层。
