@@ -7,6 +7,35 @@
 >
 > 与之相对，`README.md` / `runtime-internals.md` / `architect-notes.md` 写的是墙内的一半（全部实测）。
 
+## 0. 官方印证：Meta Research 博客（2026-09）
+
+Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/blog/security-and-safety-for-ai-agents-our-approach-with-muse)，
+亲述生产级安全/安全架构。逐条对照本仓库的推断：
+
+| 博客披露 | 本仓库对应位置 | 状态 |
+|---|---|---|
+| `systemd-nspawn` runtime cell；Hatch 为 Muse 的内部代号 | README 总览 | ✅ 确认 |
+| cell 内 root 映射为非特权 host 用户（user namespace） | — | ➕ 新增 |
+| 过滤 syscall（如无 `io_uring`）、限制 capability | architect-notes §4 | 🔧 见下注 |
+| Sentinel 是连接器动作与网络出站的**唯一**审批权威 | §2.6 / §2.11 | ✅ 确认 |
+| surrogate token：authd 签发替身，Sentinel 在网络边界替换为真凭证，agent 永不见真密钥 | §2.5 | ✅ 确认（与 github skill 中 `hsurr:*` 机制互证） |
+| cell 与 VM 服务经 Unix socket + `SO_PEERCRED` + peer ACL 通信，无秘密可偷 | runtime-internals §3 | ✅ 确认 |
+| `privsep` workers 在 cell 外执行连接器逻辑，凭证不出 agent 作用域 | architect-notes 未解 #6 | ✅ 官方解答 |
+| `hatch-authd` 管凭证存储；OAuth token 存于用户 VM，**不在中心化 Meta 基建** | — | ➕ 新增 |
+| `hatch-safety`：独立模型/分类器在 cell 外检查推理出入，防 prompt injection | §2.11 | ➕ 新增 |
+| Postgres 存 durable application state，与 runtime cell、凭证库三权分立 | architect-notes §2 | ✅ 确认 |
+| **tainted egress**：eBPF 做进程级 taint 追踪，干净进程走 auto-allow，污染进程走审批 | — | ➕ 新增（核心机制，见 §2.6） |
+| 浏览器：CDP broker 在 cell 外；agent 只见无障碍树（非 DOM）、禁 JS；凭证注入时 agent 被暂停 | — | ➕ 新增（见 §2.12） |
+| 邮件连接器过滤 OTP/密码重置链接（确定性规则 + 分类器） | — | ➕ 新增 |
+| 每用户 dedicated VM；VM 数据持续备份 | architect-notes 未解 #4 | ✅ 部分确认 |
+| Bug bounty 最高 $300k；prompt injection 单项最高 $130k | — | ➕ 新增 |
+| Muse Confidential VM 路线图（密码学上让 Meta 也无法访问） | — | ➕ 新增 |
+
+> 注（capability 差异）：博客称去掉了 `CAP_SYS_PTRACE` / `CAP_NET_ADMIN` 等；
+> 实测本 exec 进程 `CapEff=000001fffff7ffff` 经 `capsh --decode` 显示 `SYS_PTRACE` 已去、
+> `NET_ADMIN` / `SYS_ADMIN` 仍在。最可能的解释是**不同进程的 cap 集合不同**
+> （daemon 主进程 vs 派生的 exec），或博客为简化表述。`SYS_PTRACE` 被去是双方一致的。
+
 ## 1. 完整架构图
 
 ```
@@ -78,6 +107,10 @@
 
 - ✅ 痕迹：`hatch-ca-trust.service` 从 `/run/hatch/cell-anchors/` 取 `hatch-egress-ca.pem` / `hatch-ingress-ca.pem`；代理 URL 里按实例签发的凭证（`hatch-runtime:<redacted>@hatch-egress-proxy:3128`）。
 - 🔍 强推断：宿主机侧有一个 CA/身份服务：容器启动时签发实例身份、下发 CA 锚点、签发代理凭证。实例凭证大概率是短期的（启动时签发、销毁时作废）。
+- ✅ 官方确认（2026-09 博客）：`hatch-authd` 负责凭证存储；OAuth token 等**存于用户 VM，不在中心化 Meta 基建**；
+  且凭证经**surrogate 机制**流转 —— authd 签发替身 token（形如 `hsurr:*`，在 github skill 代码中可直接看到），
+  cell 内代码永远只见替身；Sentinel 在网络边界把替身替换为真凭证。agent 被 prompt injection 套话也套不出真密钥，
+  因为它手里从来就没有。
 - 💭 生产级要点：这是零信任的基石 —— 没有长期密钥可以偷，每次启动都是新身份。`cell-anchors` 这个名字说明锚点是按"cell（容器）"作用域签发的。
 
 ### 2.6 网络平面
@@ -87,6 +120,18 @@
   - 出站：TLS 拦截式审计代理集群（3128 是 Squid 系默认端口）；sentinel 做策略审批（不是所有出站都自动放行）。
   - 入站：ingress CA 的存在说明有**入站面** —— 最可能用于"浏览器接管"（用户接管容器内浏览器）和实时连接。
 - 💭 生产级要点：出站 MITM 代理是 DLP（防数据泄露）和合规审计的标准做法；审批面说明策略是**运行时强制**的。入站面的存在意味着网络策略是双向的，不是简单的 NAT 出访。
+
+#### Tainted egress（✅ 官方确认，2026-09 博客）
+
+这是出站审批**不打扰用户**的秘密：
+
+- 每个工具执行进程启动时是"干净"的，一旦读取用户数据就被"污染"（taint）。
+- 实现：eBPF `cgroup` 程序做网络拦截与进程归因 + 挂在 LSM hook 上的 eBPF 程序做 taint 传播。内核级数据流追踪。
+- 干净进程 + 窄范围 auto-allow 策略 + URL 检查通过 → **直接放行，不打扰用户**。
+- 被污染或无法验证的进程 → 回落到正常审批流（问用户）。
+- 配套：SSRF 防护（防止公网域名解析后指向内网地址）；Sentinel 在 L4/L7 两层评估目标（hostname、最终 IP、端口、协议、HTTP 方法、路径、解码后的实际请求）。
+
+一句话：审批摩擦只放在"数据可能外流"的地方，日常操作无感 —— 这就是 approval card 时有时无的原因。
 
 ### 2.7 数据平面：btrfs + Postgres
 
@@ -119,7 +164,22 @@
 
 - ✅ 痕迹：sentinel（审批 + http-api）、safety/security.sock、privsep 目录、rescue-signal.sock + hatch-rescue 二进制、seccomp-bpf + NoNewPrivs、零 TCP 监听。
 - 🔍 强推断：sentinel 是策略执行点（出站审批只是其中之一）；privsep 是特权分离执行器（高风险操作降权执行）；rescue 是自救通道（daemon 挂了能拉起来）。
+- ✅ 官方确认（2026-09 博客），逐条：
+  - **hatch-safety**：独立的模型/分类器 ensemble，在 cell **外**检查进出核心推理的请求与响应，专防 prompt injection 等前沿风险 —— 攻击者即使拿下 cell 也关不掉它。这对应 `/run/hatch/safety/security.sock`。
+  - **privsep**：内置连接器的业务逻辑在 cell 外的 systemd 沙箱 worker 里执行，worker 按 `cgroup` 标识、有显式凭证 allowlist（日历 worker 拿不到邮件凭证）。这回答了 architect-notes 未解 #6。
+  - **hatch-authd**：凭证（OAuth token 等）存于**用户 VM 内的独立隔离容器**，不在 Meta 中心化基建。
+  - **user namespace**：cell 内 root 映射为宿主机上的非特权用户 —— cell root ≠ host root。
+  - **纵深防御链**（官方原话）：runtime cell 限制系统访问 → privsep 限制代码与凭证的可见性 → authd 做 ACL → Sentinel 评估每个动作与所有出站。
 - 💭 设计理由：假设容器**一定会被攻破** —— 所以能力（cap）没降（agent 要干活），但把"危险动作"收到几个 choke point（代理、审批、privsep）里。这是"纵深防御"的现代版本：不追求铜墙铁壁，追求**每个危险动作都可审计、可拦截**。
+
+### 2.12 浏览器平面（✅ 官方确认，2026-09 博客）
+
+- 真实 Chromium 跑在**虚拟化层之后**；CDP 连接由 cell 外的 broker 管理。
+- 驱动浏览器的 sub-agent 只能看到**无障碍树快照**（不是原始 DOM），禁 JS、无脚本动词、DevTools 禁用 —— 它读不到凭证库填进表单的值。
+- 用户接管浏览器、或凭证库正在填表时，agent 被**暂停**，完全不能动作。
+- 一组独立分类器实时盯着：与任务无关的个人数据外发、DOM/图片/下载文件中的注入、高风险表单提交 —— 触发则拦截或弹人工复核。
+- Meta 现有的恶意网站黑名单在 VM 内直接生效，浏览器不会导航到已知有害站点。
+- 💭 要点：浏览器是"被污染数据"的主要入口，所以它的隔离做得比通用工具执行更深 —— 连"看"都被降级为无障碍树。
 
 ## 3. 核心设计决策及其理由
 
@@ -154,10 +214,20 @@
 
 ## 5. 未知清单（墙外黑盒）
 
+2026-09 官方博客发布后，以下条目已有答案（划线），其余仍未知：
+
 1. 调度器：选机算法、pre-warm 水位、回收 idle 超时、超售比
 2. hotset 生成策略：触发条件、tier1/tier2 语义、刷新周期
-3. Postgres：主备形态、备份策略、schema
-4. 出站审批策略：什么要批、谁来批、延迟多少
+3. Postgres：主备形态、备份策略、schema（备份已确认"持续备份"，其余未知）
+4. 出站审批策略：什么要批、谁来批、延迟多少（tainted egress 机制已确认，策略细节未知）
 5. 入站面真实用途（ingress CA）
 6. 计算/数据分区的真实含义（zas/rcd）
 7. sentinel 的完整策略面
+8. ~~privsep 目录的真实用途~~ → ✅ 官方已答：cell 外的连接器沙箱 worker
+9. ~~VM 数据备份策略~~ → ✅ 官方已答：持续备份
+
+## 6. 路线图：Muse Confidential VM（✅ 官方披露）
+
+- 当前架构：隔离用户数据、限制 Meta 人员访问（运营政策层面），但**不阻止 Meta 在必要时访问数据**（支持、安全、运营）。
+- Confidential VM 目标：用密码学**可验证地**让 Meta 也无法访问 VM 内数据；已小范围可信测试 + 开放外部审计，源码逐步公开。
+- 💭 这是"把信任从政策变成数学"的尝试 —— 也是对"墙外一半"的终极回答：如果连 Meta 都看不见，墙外就只剩纯粹的机器。
