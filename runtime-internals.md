@@ -85,6 +85,10 @@ NODE_EXTRA_CA_CERTS=…   REQUESTS_CA_BUNDLE=…
 | `JARVIS_TELEMETRY_PROXY_SOCK` | `/run/hatch/telemetry/telemetry.sock` | 遥测 |
 | `JARVIS_EGRESS_APPROVAL_*` | `/run/hatch/sentinel/egress-approvals-*.sock` | 出站审批 |
 
+> ⚠️ 实测（2026-09-29）：上表中 `/run/hatch/proxy/` 整个目录在 cell 的 mount ns 里**不存在**（父目录和其他子目录都在，唯独 proxy 被摘除），
+> 容器内直连 `inference.sock` 会 ENOENT。推理通道的真实形态是 host 侧 daemon 派驻进 cell netns 维护的**短连接池**
+> （约 9 条预热最小池、按需扩容、空闲约 30 秒回收换血），详见 production-architecture.md §2.13。
+
 ### 其他
 
 ```bash
