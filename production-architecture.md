@@ -105,7 +105,12 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 - ✅ 痕迹：`JARVIS_VM_COMPUTE_REGION=zas` / `JARVIS_VM_DATA_REGION=rcd`（计算与数据分区）；容器按需启动、空闲回收（实测）。
 - 🔍 强推断：必然存在一个中心调度器，负责选物理机、维护 VM 池水位、决定容器回收时机。计算/数据分区说明调度是 region-aware 的。
 - 💭 生产级要点：
-  - **VM 池化**：VM 是常驻池（`rv-identity-ready` 时间戳晚于容器启动即证据），容器是池上按需分配 —— 池化把"分钟级 VM 启动"从关键路径上拿掉，冷启动只剩"秒级容器启动"。
+  - **VM 池化**：~~VM 是常驻池（`rv-identity-ready` 时间戳晚于容器启动即证据），容器是池上按需分配~~ ——
+    **修正（✅ 2026-09-30 lifecycle verdict 实测）**：VM 本体也会在闲置后被回收、按需重建。
+    9-29 10:55 存 baseline（btime=1790647786），9-30 10:13 复测 btime=1790727854（内核 9-30 08:24:14 CST 新启动，
+    pid1 在其后约 74 秒拉起，uptime 吻合）—— 整台 VM 隔夜闲置后被回收，今晨按需重建。
+    所以回收粒度不是"只杀容器留 VM"，而是**整台 VM 一起回收**；冷启动路径里 VM 启动是真实成本（只是被"秒级容器启动"的叙事掩盖了）。
+    先前"VM 是常驻池"的推断不成立 —— 至少在无流量过夜的场景下，VM 不保温。
   - **装箱策略**：2核/7G 是固定规格（T-shirt sizing），简化装箱；steal time 说明物理机超售，调度器要做 noisy-neighbor 感知（或至少不做保证）。
   - **回收策略**：idle 超时 + 压力抢占两档；`draining` 文件（pre-start.sh 里出现过）说明有优雅驱逐协议。
   - **区域分离**：计算（zas）与数据（rcd）分区，常见理由是延迟/合规/成本 trade-off，细节未知。
@@ -117,6 +122,11 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
   - **KVM 层（Cloud Hypervisor）**：硬隔离边界。防的是容器逃逸影响整台物理机上的其他租户。Cloud Hypervisor 选型说明要的是"轻"，不是 VMware 式的重。
   - **nspawn 层**：速度。与宿主共享内核，省掉 guest OS 启动，秒级拉起；且能直接 bind 挂载宿主机资源（btrfs 卷、CA 锚点）。
 - 💭 设计理由：一层给**安全**（租户隔离），一层给**速度**（按需启动）。单用 KVM 太慢，单用容器隔离不够 —— 这是经典的纵深取舍，不是过度设计。
+- ✅ 生命周期信号修正（2026-09-29/30 实测）：
+  - `/proc/sys/kernel/random/boot_id` 在容器内被 nspawn 用 per-cell tmpfs 文件 **overmount** —— 它是 **cell 级**信号，不是 VM 级。
+  - `/proc/stat` 的 `btime` 未被 overmount —— 它是真正的 **VM 内核启动时间**（VM 级信号）。
+  - 判别式：btime 变 → 整台 VM 重建；btime 不变 + boot_id 变 → 只重建了 nspawn cell；两者都不变 + epoch 涨 → 纯 handoff。
+  - 实测 verdict（9-30）：**VM reclaimed** —— btime 1790647786 → 1790727854，整台 VM 隔夜闲置后被回收、9-30 08:24:14 CST 按需重建。
 
 ### 2.3 spawnd：宿主机编排器
 
@@ -175,6 +185,7 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 
 - ✅ 痕迹：`/run/hatch/resume/` 全套（epoch、marker、hotset.manifest、proof）；hotset 845 条目/61MB/tier1+tier2；02:15 撞见的一次 handoff（容器未重启）。
 - 🔍 强推断：宿主机侧有一个 warmer/handoff 编排器：定期或按需把 Postgres 热数据块读进 page cache、生成 manifest、推进 epoch。handoff 不一定伴随容器重建 —— 它是**独立的"世代"维度**。
+- ✅ 实测补充（2026-09-30）：VM 整台重建后 handoff-epoch 从 26 继续推进到 35 —— handoff 世代与"回收/重建"是**正交的两个维度**：回收杀的是机器，handoff 推进的是数据预热世代，重建后 epoch 不归零。
 - 💭 生产级要点：这是整个架构里最精妙的一笔 —— 把"冷启动"重新定义为"带着预热缓存的苏醒"。61MB 的预热清单说明有人实测过"哪些块值得预热"，是数据驱动的优化，不是拍脑袋。
 
 ### 2.9 推理平面（模型在容器外）
@@ -209,6 +220,29 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 - 一组独立分类器实时盯着：与任务无关的个人数据外发、DOM/图片/下载文件中的注入、高风险表单提交 —— 触发则拦截或弹人工复核。
 - Meta 现有的恶意网站黑名单在 VM 内直接生效，浏览器不会导航到已知有害站点。
 - 💭 要点：浏览器是"被污染数据"的主要入口，所以它的隔离做得比通用工具执行更深 —— 连"看"都被降级为无障碍树。
+
+### 2.13 推理通道：unix socket 短连接池（✅ 实测，2026-09-29/30）
+
+推理通道不是一条长连接，而是一个**随负载涨落的短连接池**（`ss -x` before/after 快照 + 逐 2 秒采样 120 秒，证据链完整）：
+
+- **形状**：空闲时常年维持约 **9 条预热最小池**；每次模型调用约新建 1–2 个连接（一次 4–5 次调用的实验窗口打出 +7，9→16，归因干净）；
+  流量停后约 30 秒缩回 9，**整个池子换血、无粘性连接、无长连接**。
+- **churn 与模型调用严格同步**：活跃期每 2 秒 md5 都在变，空闲后连续 38 个采样点 md5 一字不差 —— 排除后台 keepalive 自扰。
+- **路被藏起来了**：`/run/hatch/` 在 cell 里有十几个子目录，唯独**没有 `proxy/`**（外科手术式摘除）；
+  容器内 `connect("/run/hatch/proxy/inference.sock")` 直接 ENOENT。
+- **内核 quirk（实测证实）**：AF_UNIX `connect()` 时，accepted 端 socket 按 **client 的 netns** 分配。
+  判别式实验（`unshare -n` 对照）：accepted 端只出现在 connector 所在 netns 的 `/proc/net/unix` 里。
+  由此 cell 表里的行可精确分类 —— `St=01`+path = listener；`St=03`+path = proxy 侧 accepted 端；`St=03`+空 path = client 端。
+  推论：listener（St=01）在 host netns 里 bind，cell 里永远看不见；表里 11 个带 path 的 `St=03` 行**全是 proxy 侧 accepted 端**。
+- **客户端是谁**：连接两端都在 cell 的 netns 表里 ⇒ `connect()` 发生在 cell netns 内 ——
+  推理客户端是 host 侧**派驻进 cell netns 的 `hatch daemon`（PID 67，`ppid=0`，`--runtime-cell-leader=2134`）**。
+  但它自己的 mount ns 里也没有 `proxy/`（mountinfo 可读，38 个 hatch 挂载、0 个含 proxy），
+  所以它靠 mount 视角之外的东西建连接：继承的 dirfd（经 `/proc/self/fd/<N>/inference.sock` 绕过 mount ns）
+  或 host 侧父进程代建后递 fd —— yama（`ptrace_scope=1`）挡住了 67 的 fd 表与 environ，最后一步无法直接证实，这本身也是设计的一部分。
+- **"只有持 fd 者能用"的完整形态**：path（bind 在 cell 看不见的 mount 视角）+ fd（yama 墙后）双保险。
+  cell 能看见连接存在（内核表按 netns 可见），但既连不上（ENOENT）也看不见持有者。
+
+一句话：推理通道是"看得见车、看不见司机、上不去车"的短连接池 —— 可观测性止于 netns 边界，能力止于 mount+yama 边界。
 
 ## 3. 核心设计决策及其理由
 
