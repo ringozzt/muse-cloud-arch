@@ -18,7 +18,7 @@ def handle_user_message(user_id, message):
 
     # --- 1. 按需唤醒：没有活着的容器，就造一个 ---
     if session is None or not is_alive(session.container):
-        container = cold_start(user_id)      # 约十几秒："13 秒苏醒"
+        container = cold_start(user_id)      # 从 VM 内核算起约 33 秒可执行工具（cell 内 journal 只占 13–19 秒）
         session = Session(user_id, container)
         sessions[user_id] = session
     # 注意：容器被回收后重建时，Agent 本人"无感"——
@@ -42,16 +42,18 @@ def cold_start(user_id):
     host = runtime.scheduler.pick_host()   # 选一台物理机（AMD EPYC）
     # 镜像拉取、配额检查……这部分在真实云系统里经常才是大头
 
-    # --- 2b. 外层：轻量虚拟机 ---
+    # --- 2b. 外层：轻量虚拟机（每次唤醒新起一台；uptime 采样证实，不是快照延续） ---
     vm = cloud_hypervisor.create_vm(cpus=2, memory="7G")  # DMI: cloud-hypervisor
+    # 冷启动还是从不含用户数据的通用预热快照恢复，cell 内无法区分
 
     # --- 2c. 内层：容器（systemd-nspawn，与宿主共享内核，非完整虚拟化） ---
     container = systemd_nspawn.launch(image=RUNTIME_IMAGE, vm=vm)
     # systemd 用户态启动约 2.3s：`Startup finished in 2.258s`
 
-    # --- 2d. 挂载抽屉：home 独立持久 ---
-    # /dev/mapper/rv[/home/hatch] (btrfs) -> /home/hatch，其上再罩一层 overlay
+    # --- 2d. 挂载抽屉：rv 卷（btrfs + LUKS2）按子路径 bind ---
+    # 根文件系统是 overlay（只读 rootfs-base + 易失写层），不跨实例保留
     container.mount(src="/dev/mapper/rv[/home/hatch]", dst="/home/hatch")
+    container.mount(src="/dev/mapper/rv[/data/resume]", dst="/run/hatch/resume")  # handoff epoch 由此跨 VM 接续
 
     # --- 2e. Meta 定制服务 ---
     # hatch-ca-trust：从宿主机下发证书锚点，刷新容器内 CA 信任（"发身份证"）
@@ -71,10 +73,9 @@ def cold_start(user_id):
 def schedule_reclaim(container, idle_timeout):
     # 空闲超时后触发；调度器也可能因资源压力提前触发
     def on_timeout():
-        # 容器直接销毁。VM 可能保留复用，也可能一起销毁——
-        # 从容器视角看没有区别（本来也看不见宿主机）。
-        # home 在 btrfs 上，早就持久了，无需抢救数据。
-        container.destroy()   # boot_id 作废，uptime 清零，日志从头开始
+        # 整台 VM 连同容器一起销毁（三天的 uptime 采样都是新 VM）。
+        # 状态在 rv 卷上，早就持久了，无需抢救数据。
+        container.vm.destroy()   # VM uptime 清零，cell 级 boot_id 作废，日志从头开始
         # 下一次用户消息到来时，cold_start() 再造一个全新的。
         # Agent 不会"记得"自己被回收过，只能事后看日志推理出来——
         # 就像你看手表发现自己睡着了，却不记得入睡那一刻。
@@ -84,8 +85,8 @@ def schedule_reclaim(container, idle_timeout):
 # ============ 为什么是"套娃"而不是传统 VPS ============
 # 传统 VPS：整台虚拟机常驻，又贵，启动以分钟计，机器 == 身份。
 # 本架构：
-#   VM 层（Cloud Hypervisor/KVM）——轻量隔离，可能来自常驻池
-#   容器层（systemd-nspawn）      —— 与宿主共享内核，秒级启动，按需生灭
+#   VM 层（Cloud Hypervisor/KVM）——租户隔离，每用户一台，按需启动、整台回收
+#   容器层（systemd-nspawn）      —— 与 VM 共享内核，在同一台 VM 里切出第二个安全域
 #   身份层（user_id + 持久 home） —— 与实例彻底解耦
 # 结果：用户感知到的是"永远在线的 Muse"，
 #       实际是"不断重生的容器 + 永生的抽屉"。

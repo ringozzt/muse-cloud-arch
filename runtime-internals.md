@@ -27,7 +27,7 @@
 │   ├── memory/ / dreams/       # 长期记忆与关系图谱
 │   ├── workspace/              # 工作区（含 skills、goals、projects）
 │   └── uploads/                # 用户上传文件中转
-└── run/hatch/                  # 运行时总线（tmpfs，随容器生灭）
+└── run/hatch/                  # 运行时总线（tmpfs，随容器生灭；resume/ 例外，来自 rv 卷）
     ├── cell-anchors/           # 宿主机下发的 CA 锚点（hatch-egress-ca.pem…）
     ├── egress-tls/             # ca-bundle.pem（见 §3）
     ├── runtime-cell/           # runtime-cell.ready 就绪标记等
@@ -88,6 +88,8 @@ NODE_EXTRA_CA_CERTS=…   REQUESTS_CA_BUNDLE=…
 > ⚠️ 实测（2026-09-29）：上表中 `/run/hatch/proxy/` 整个目录在 cell 的 mount ns 里**不存在**（父目录和其他子目录都在，唯独 proxy 被摘除），
 > 容器内直连 `inference.sock` 会 ENOENT。推理通道的真实形态是 host 侧 daemon 派驻进 cell netns 维护的**短连接池**
 > （约 9 条预热最小池、按需扩容、空闲约 30 秒回收换血），详见 production-architecture.md §2.13。
+> 上表 13 个路径里，cell 文件系统中只能看到 auth、sandbox-api、telemetry 三个；其余服务的路径不可见，
+> 但在 cell 的 `/proc/net/unix` 里都有已建立的连接（verification-log §7）。
 
 ### 其他
 
@@ -144,21 +146,29 @@ Restart=always
 
 ## 5. 数据卷
 
-`/proc/mounts` 中与持久化相关的条目：
+> 更正（09-29 10:55 用 `findmnt` 取完整挂载表后）：本节初版把 overlay 记在了 `/home/hatch` 上，实际 overlay 在 `/` 上。
+
+`findmnt` 中与持久化相关的条目：
 
 ```
-overlay /home/hatch overlay rw,relatime,
-    lowerdir=/sysroot,upperdir=/run/hatch/overlay/upper,workdir=/run/hatch/overlay/work,…
-/dev/mapper/rv /home/hatch btrfs rw,nosuid,nodev,noatime,
-    compress-force=zstd:3,ssd,discard=async,space_cache=v2,subvol=/
+/            overlay[/var/lib/hatch-runtime/rootfs-base] overlay rw,relatime,
+                 lowerdir=/sysroot,upperdir=/run/hatch/overlay/upper,workdir=/run/hatch/overlay/work,
+                 redirect_dir=on,uuid=on,metacopy=on,fsync=volatile,nouserxattr
+/home/hatch  /dev/mapper/rv[/home/hatch] btrfs rw,nosuid,nodev,noatime,
+                 compress-force=zstd:3,ssd,discard=async,space_cache=v2
 ```
 
-解读 —— "抽屉"的两层结构：
+解读：
 
-1. **底层（btrfs）**：`/dev/mapper/rv` 上的子卷，`zstd:3` 强制压缩。机器销毁后数据仍在，这是"换机文件还在"的物理基础。
-2. **上层（overlay）**：`lowerdir=/sysroot`（只读镜像层）+ `upperdir=/run/hatch/overlay/upper`（本容器写层）。容器内看到的 `/home/hatch` 是合并视图。
+1. **持久层（btrfs）**：`/dev/mapper/rv`，100 GB，`zstd:3` 强制压缩，dm uuid 为 `CRYPT-LUKS2`（LUKS2 加密卷）。
+   除了 `/home/hatch`，`/data/resume`、`/data/os-intent`、`/data/apt-archives` 等子路径也从这块卷 bind 进 cell。机器销毁后数据仍在，这是"换机文件还在"的物理基础。
+2. **根文件系统（overlay）**：只读下层是 VM 侧的 rootfs-base，写层是 VM 侧的 `/run/hatch/overlay/upper`，`fsync=volatile`。
+   两个路径都只在 VM 的挂载命名空间里，所以 cell 内 `ls` 不到。VM 侧另有一个 `root_overlay` 设备（`CRYPT-PLAIN`，plain dm-crypt），
+   从名字看很可能是这个写层的底座；rootfs 写入是否跨实例保留，尚未直接验证。
+3. **只读层**：`/dev/mapper/opt_hatch` 是 squashfs，dm uuid 为 `CRYPT-VERITY`（dm-verity 校验），提供 `/opt/hatch`、`/home/hatch/assets`。
+4. **被屏蔽的路径**：`/etc/hatch/credentials`、`/var/lib/hatch/postgres` 以 nspawn `--inaccessible` 挂载。
 
-其余挂载均为常规容器标配（cgroup、/proc、/sys、tmpfs），无特殊。
+完整的子路径表见 [verification-log.md §4](./verification-log.md#4-存储-)。
 
 ## 6. 没有 Dockerfile
 
@@ -175,8 +185,11 @@ overlay /home/hatch overlay rw,relatime,
         │
         │  所有出站 HTTP(S)
         ▼
-hatch-egress-proxy:3128（按实例凭证，TLS 经自签 CA）
+hatch-egress-proxy:3128（= 网关本身，按实例凭证，TLS 经自签 CA）
         │
         ▼
-   公网（含 IPv6 fd8b:4f84:7d32:99::/64 ULA 段）
+      公网
 ```
+
+- `fd8b:4f84:7d32:99::/64` 是 cell ↔ 网关之间的 IPv6 ULA 内部地址（cell 为 `::2`，网关为 `::1`），不是公网段。
+- 绕过代理直连会失败：`curl --noproxy '*'` 访问 `example.com` 和 `1.1.1.1` 都返回 `000`，且没有弹审批（10-01 实测）。

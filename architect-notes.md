@@ -5,10 +5,14 @@
 > 容器活着的时候也会做 **handoff**（世代交接 checkpoint）：02:14–02:15 笔者调查期间恰好撞见一次，
 > marker 写入、hotset 重新生成，而容器并未重启（uptime 自 00:56 连续）。
 > 所以是三层：**宿主机/VM（长周期）→ 容器（按需重建）→ 运行时世代 epoch（活体 checkpoint）**。
+>
+> 更正（09-29 至 10-01 的 uptime 纵向采样）：VM 并不是长周期的，三次采样每次都是新起的 VM，回收粒度是整台 VM。
+> 三个维度应改为：**rv 数据卷（长期）→ VM + cell（每次唤醒新起）→ handoff epoch（跨 VM 接续的交接计数）**。
+> 本文 §1、§3、§7 和未解之谜 #1 已据此修订，完整勘误见 [verification-log.md](./verification-log.md)。
 
 ## 1. Handoff：比容器更细粒度的"世代"机制 ⭐
 
-**实测事实**（`/run/hatch/resume/`，/run 为 tmpfs，内容由宿主机侧 bind 进来）：
+**实测事实**（`/run/hatch/resume/`，从 rv 卷的 `/data/resume` bind 进来，所以 VM 重建后 epoch 能接续：26 → 35 → 41）：
 
 | 文件 | 内容 |
 |---|---|
@@ -37,29 +41,34 @@
 
 **还缺什么**：schema、备份策略、单点还是多副本 —— 全在墙外。
 
-## 3. 存储栈：四层挂载
+## 3. 存储栈：一块卷 + 一次性根文件系统
 
-**实测事实**（`/proc/mounts` 完整视图，按叠加顺序）：
+> 更正：初版把 overlay 记在 `/home/hatch` 上（"四层挂载"）。`findmnt` 完整挂载表显示 overlay 在 `/` 上。
+
+**实测事实**：
 
 ```
-/dev/mapper/rv  (btrfs, zstd:3)            → /home/hatch          # 持久底座
-overlay (lowerdir=/sysroot,                → /home/hatch          # 合并视图
-         upperdir=/run/hatch/overlay/upper)
-├─ /dev/mapper/opt_hatch (squashfs, ro)    → /home/hatch/assets   # 不可变资源层
-└─ tmpfs (ro)                              → /home/hatch/.pki/nssdb
+/dev/mapper/rv  (btrfs, zstd:3, LUKS2)     → /home/hatch、/run/hatch/resume、     # 持久底座，按子路径 bind
+                                             /var/lib/hatch/os-intent、/var/cache/apt/archives …
+overlay (lowerdir=rootfs-base,             → /                    # 一次性根文件系统
+         upperdir=VM 侧 /run/hatch/overlay/upper, fsync=volatile)
+/dev/mapper/opt_hatch (squashfs, verity)   → /opt/hatch、/home/hatch/assets   # 不可变资源层
+tmpfs (ro)                                 → /home/hatch/.pki/nssdb
 ```
 
 **为什么重要**：
-- 不可变基础设施：`assets` 是只读 squashfs 镜像，由 device-mapper 管理 —— 产品静态资源与可写数据彻底分离。
-- btrfs `zstd:3` 强制压缩：存储成本优化。
-- **反常点**：overlay 的 `upperdir=/run/hatch/overlay/upper` 路径**当前不存在**（/run 是 tmpfs），但挂载有效且可写 —— 写层的真实位置存疑，可能是挂载后路径被清理。`/sysroot`（lowerdir）同样为空。
+- 不可变基础设施：`opt_hatch` 是 dm-verity 校验的只读 squashfs —— 产品静态资源与可写数据彻底分离，被篡改会读取失败。
+- btrfs `zstd:3` 强制压缩：存储成本优化；LUKS2 做静态加密。
+- 状态全部外置到 rv 卷，所以整台 VM 可以随时扔掉。
 
-**还缺什么**：upperdir 之谜；lowerdir 为空的原因。需用 `findmnt --real` 或 nsenter 从宿主机视角确认。
+**upperdir 之谜的答案**：`/sysroot` 与 `/run/hatch/overlay/upper` 都是 **VM 挂载命名空间里的路径**，cell 内本来就看不到。
+VM 侧还有一个 plain 模式 dm-crypt 设备 `root_overlay`，从名字看很可能是写层的底座。
 
 ## 4. 隔离与安全边界
 
 **实测事实**：
 - `Seccomp=2`（bpf 过滤，4 个 filter）+ `NoNewPrivs=1`，但 `CapEff=000001fffff7ffff` —— capability 接近全集，**没有大幅降权**。
+  补充：cell PID 1 的 `CapBnd=000001fff7b4cfff` 反而缺 `NET_ADMIN`、`NET_RAW` 等 7 项。agent 进程的能力超出 PID 1 的 bounding set，说明它们是 VM 侧注入的，不是 cell 内 systemd fork 的；这些能力只在 cell 自己的 user namespace（`0 131072 65536`）里生效。
 - 容器内**零 TCP 监听端口**（`ss -tlnp` 为空）—— 对外只走 unix socket + egress proxy。
 - cgroup 视角为 `0::/`，`cpu.max`/`memory.max` 不可见 → 配额（如有）在 VM 层，容器约等于独占整台 VM。
 - steal time = 254 jiffies → 物理机与他人共享，noisy neighbor 真实存在。
@@ -76,6 +85,7 @@ overlay (lowerdir=/sysroot,                → /home/hatch          # 合并视�
 - 出站审批 socket（`sentinel/egress-approvals`）→ 不是所有出站都自由，有审批面。
 - `hatch-ingress-ca.pem` 存在 → **有入站面**（浏览器接管？用户直连？）。
 - DNS = 网关（198.19.0.1），`resolv.conf` 只读 bind。
+- 绕过代理直连（`curl --noproxy '*'` 访问域名和外部 IP）会失败，也不弹审批 —— 代理是唯一出口，不只是"默认配置"（10-01 实测）。
 
 **为什么重要**：这是"企业内网"式架构 —— 默认不信任，审计一切。sentinel 的存在说明安全策略是运行时强制的，不是文档约束。
 
@@ -97,9 +107,9 @@ overlay (lowerdir=/sysroot,                → /home/hatch          # 合并视�
 - 容器约等于独占 2 核 / 7G VM（cgroup 无配额即整机）。
 - btrfs zstd:3 压缩降存储成本；squashfs 只读层天然可多容器共享。
 
-**为什么重要**：按需容器 + 常驻 VM 池 → 成本优化点在 **VM 复用率**和**回收 idle 超时**，不在容器本身。
+**为什么重要**：~~按需容器 + 常驻 VM 池~~ 更正：VM 本身按需启动、整台回收 → 成本大致只和活跃时长挂钩，优化点在**回收 idle 超时**和**冷启动耗时**（从 VM 内核算起约 33 秒），不在容器本身。
 
-**还缺什么**：回收超时、VM 池化率、计费粒度 —— 全在调度器黑盒里。
+**还缺什么**：回收超时（目前只知道下界：VM 至少存活过 46 分钟、1 小时 49 分钟）、是否有通用预热快照、计费粒度 —— 全在调度器黑盒里。
 
 ## 8. 配置与发布
 
@@ -115,9 +125,9 @@ overlay (lowerdir=/sysroot,                → /home/hatch          # 合并视�
 
 ## 未解之谜清单（给下一次调查）
 
-1. overlay upperdir 路径不存在之谜（写层到底在哪）
+1. ~~overlay upperdir 路径不存在之谜~~ → overlay 在 `/` 上，upperdir 是 VM 挂载命名空间里的路径（见 §3）
 2. handoff 触发语义（02:15 那次是周期 checkpoint 还是活动驱动）
 3. 调度器黑盒：选机策略、pre-warm、回收超时
 4. Postgres 的 schema、备份策略、主备形态
 5. 入站面（ingress CA）的真实用途
-6. `/run/hatch/privsep` 的真实作用
+6. ~~`/run/hatch/privsep` 的真实作用~~ → 官方博客已答：cell 外的连接器沙箱 worker

@@ -33,8 +33,10 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 
 > 注（capability 差异）：博客称去掉了 `CAP_SYS_PTRACE` / `CAP_NET_ADMIN` 等；
 > 实测本 exec 进程 `CapEff=000001fffff7ffff` 经 `capsh --decode` 显示 `SYS_PTRACE` 已去、
-> `NET_ADMIN` / `SYS_ADMIN` 仍在。最可能的解释是**不同进程的 cap 集合不同**
-> （daemon 主进程 vs 派生的 exec），或博客为简化表述。`SYS_PTRACE` 被去是双方一致的。
+> `NET_ADMIN` / `SYS_ADMIN` 仍在。`SYS_PTRACE` 被去是双方一致的。
+> 后续补测（09-29 10:55）找到了差异所在：cell PID 1 的 `CapBnd=000001fff7b4cfff` 确实没有 `NET_ADMIN`，与博客一致；
+> 而 hatch daemon、hatch-execd、工具 shell 的 `CapEff` 都超出了 PID 1 的 bounding set，说明它们是 VM 侧直接注入的进程。
+> 这些能力只在 cell 自己的 user namespace 里生效。
 
 ### 官方架构图
 
@@ -56,7 +58,7 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 | 新增点 | 说明 | 与实测的互证 |
 |---|---|---|
 | Ingress = TLS + **Noise** | 客户端↔VM 传输层用 Noise 协议 | 首次得知 |
-| 持久存储 = **LUKS 加密** | `Persistent Storage → LUKS Encryption → filesystem mount` | ✅ 互证！`/dev/mapper/rv` 的 device-mapper 命名正是 LUKS 卷的典型形态 |
+| 持久存储 = **LUKS 加密** | `Persistent Storage → LUKS Encryption → filesystem mount` | ✅ 实测确认（10-01）：`/sys/block/dm-*/dm/uuid` 中 `rv` 为 `CRYPT-LUKS2`。仅凭 device-mapper 命名无法得出这一结论（`opt_hatch` 同为 dm 设备，却是 `CRYPT-VERITY`） |
 | **rootful guest** | cell 内有 root，但 `guest root != host root`，且 `no host secrets, no Sentinel state` | 修正：靠 user namespace + ACL 做隔离，而非去 root 化 |
 | execd sandbox：seccomp w/filters | exec 沙箱的 seccomp 是带过滤器的 | 与实测 `Seccomp=2` 一致 |
 | Credential Capture UI | 客户端内的凭证采集 UI，凭证直达 authd | 与 Secure Vault 流程对应 |
@@ -78,13 +80,13 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
         ┌───────────────────────────────────────▼───────────────────────────────────────┐
         │ 物理机池（AMD EPYC，多租户；steal time 证明 CPU 共享）                        │
         │  ┌──────────────────────────────────────────────────────────────────────┐   │
-        │  │ Cloud Hypervisor VM（2核/7G，**常驻池**，非按需创建）                 │   │
+        │  │ Cloud Hypervisor VM（2核/7G，每用户一台，**按需启动、整台回收**）    │   │
         │  │                                                                      │   │
         │  │  ┌────────────────────────────────────────────────────────────┐   │   │
-        │  │  │ systemd-nspawn 容器 htch-runtime（**按需**生灭）            │   │   │
+        │  │  │ systemd-nspawn 容器 htch-runtime（随 VM 生灭）              │   │   │
         │  │  │  · systemd + hatch-ca-trust(oneshot)                        │   │   │
         │  │  │  · hatch daemon / hatch-execd（常驻进程）                   │   │   │
-        │  │  │  · /home/hatch ← btrfs 独立子卷（持久）                     │   │   │
+        │  │  │  · /home/hatch ← rv 卷子路径（btrfs + LUKS2，持久）         │   │   │
         │  │  │  · 出站全经 egress-proxy:3128（自签 CA）                     │   │   │
         │  │  │  · 推理经 /run/hatch/proxy/inference.sock（容器外）         │   │   │
         │  │  └────────────────────────────────────────────────────────────┘   │   │
@@ -109,10 +111,14 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
     **修正（✅ 2026-09-30 lifecycle verdict 实测）**：VM 本体也会在闲置后被回收、按需重建。
     9-29 10:55 存 baseline（btime=1790647786），9-30 10:13 复测 btime=1790727854（内核 9-30 08:24:14 CST 新启动，
     pid1 在其后约 74 秒拉起，uptime 吻合）—— 整台 VM 隔夜闲置后被回收，今晨按需重建。
+    10-01 13:51 第三次采样 btime=1790831384（内核 10-01 13:09:44 CST，uptime 2523 s），又是一台新 VM。
+    （10-01 复核时 pid1 偏移记为 14–15 秒，与上面的"约 74 秒"不一致，待原始输出核对；见 verification-log.md §2。）
     所以回收粒度不是"只杀容器留 VM"，而是**整台 VM 一起回收**；冷启动路径里 VM 启动是真实成本（只是被"秒级容器启动"的叙事掩盖了）。
     先前"VM 是常驻池"的推断不成立 —— 至少在无流量过夜的场景下，VM 不保温。
   - **装箱策略**：2核/7G 是固定规格（T-shirt sizing），简化装箱；steal time 说明物理机超售，调度器要做 noisy-neighbor 感知（或至少不做保证）。
   - **回收策略**：idle 超时 + 压力抢占两档；`draining` 文件（pre-start.sh 里出现过）说明有优雅驱逐协议。
+    ✅ 已知下界：VM 至少存活过 46 分钟、1 小时 49 分钟。10-01 每 30 分钟一次的心跳任务全部成功，VM 却在 12:58 那次心跳后约 11 分钟内被回收 ——
+    要么定时任务不算"活跃"，要么每次心跳单独唤醒一台 VM，cell 内无法区分。
   - **区域分离**：计算（zas）与数据（rcd）分区，常见理由是延迟/合规/成本 trade-off，细节未知。
 
 ### 2.2 嵌套虚拟化：为什么是"套娃"
@@ -120,13 +126,20 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 - ✅ 痕迹：DMI `cloud-hypervisor` + `systemd-detect-virt → systemd-nspawn`。
 - 🔍 强推断：两层各司其职 ——
   - **KVM 层（Cloud Hypervisor）**：硬隔离边界。防的是容器逃逸影响整台物理机上的其他租户。Cloud Hypervisor 选型说明要的是"轻"，不是 VMware 式的重。
-  - **nspawn 层**：速度。与宿主共享内核，省掉 guest OS 启动，秒级拉起；且能直接 bind 挂载宿主机资源（btrfs 卷、CA 锚点）。
-- 💭 设计理由：一层给**安全**（租户隔离），一层给**速度**（按需启动）。单用 KVM 太慢，单用容器隔离不够 —— 这是经典的纵深取舍，不是过度设计。
+  - **nspawn 层**：第二个安全域。与 VM 共享内核，多一层几乎不增加启动成本（cell 内 systemd 约 2.3 秒）；能直接 bind 挂载 VM 侧资源（rv 卷子路径、CA 锚点），又能用 `--inaccessible` 把凭证库和 Postgres 数据目录挡在外面。
+- 💭 设计理由（修订）：最初以为一层给**安全**、一层给**速度**。但既然 VM 每次唤醒都新起，nspawn 并没有省掉 VM 启动；
+  它的价值在于在同一台 VM 里切出第二个安全域 —— 处理不可信数据的 agent 在 cell 里，持有凭证与策略的服务在 cell 外。
+  这正是官方说的"两个隔离的安全域在一台机器上"。
 - ✅ 生命周期信号修正（2026-09-29/30 实测）：
   - `/proc/sys/kernel/random/boot_id` 在容器内被 nspawn 用 per-cell tmpfs 文件 **overmount** —— 它是 **cell 级**信号，不是 VM 级。
   - `/proc/stat` 的 `btime` 未被 overmount —— 它是真正的 **VM 内核启动时间**（VM 级信号）。
   - 判别式：btime 变 → 整台 VM 重建；btime 不变 + boot_id 变 → 只重建了 nspawn cell；两者都不变 + epoch 涨 → 纯 handoff。
+    ⚠️ 修正：btime = 当前时间 − uptime，VM 从快照恢复后会跟着平移，所以"btime 变了"不足以区分新 VM 和快照恢复。
+    更稳的判据是 **uptime 长度**：uptime ≈ cell 已运行时间 + 十几秒 → 新起的 VM；明显更长 → 常驻或快照延续。
+    uptime 第二字段（CPU 累计空闲时间）可交叉校验 uptime 没被虚拟化。
   - 实测 verdict（9-30）：**VM reclaimed** —— btime 1790647786 → 1790727854，整台 VM 隔夜闲置后被回收、9-30 08:24:14 CST 按需重建。
+  - 按 uptime 判据复核三次采样（9-29 / 9-30 / 10-01：46 分钟 / 1.8 小时 / 42 分钟）：都是新起的 VM，不是快照延续。
+    冷启动还是从不含用户数据的通用预热快照恢复，cell 内无法区分。
 
 ### 2.3 spawnd：宿主机编排器
 
@@ -153,6 +166,9 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 ### 2.6 网络平面
 
 - ✅ 痕迹：全量出站经 `hatch-egress-proxy:3128`；6 个 `*_CA_BUNDLE` 指向自签 CA；出站审批 socket（sentinel）；`hatch-ingress-ca.pem`；网关 198.19.0.1 做 DNS；veth `ve-htch-runtime`。
+- ✅ 绕过测试（10-01）：`curl --noproxy '*' -m 5` 访问 `example.com` 与 `1.1.1.1` 均返回 `000`，没有弹审批 —— 代理之外没有出路。
+- ✅ 入站痕迹：`/opt/hatch/bin` 里有 `ingress-rev-proxy`。
+- 🔍 `proxy/stefi.sock`：skill 评测笔记提到「stefi-proxy」把 FlightAware 路由到 passthrough 代理，应是出站路由的一环，完整职责未知。
 - 🔍 强推断：
   - 出站：TLS 拦截式审计代理集群（3128 是 Squid 系默认端口）；sentinel 做策略审批（不是所有出站都自动放行）。
   - 入站：ingress CA 的存在说明有**入站面** —— 最可能用于"浏览器接管"（用户接管容器内浏览器）和实时连接。
@@ -174,8 +190,10 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 
 - ✅ 痕迹：`/dev/mapper/rv` btrfs（`zstd:3` 压缩）；hotset 条目指向 `/var/lib/hatch/postgres`；`postgres_system_identifier`；`pg-clean.proof`；`~/.hatch-db-change-signals/`。
 - 🔍 强推断：数据面至少两部分 —— btrfs 卷（用户文件，跨容器世代持久）+ Postgres（结构化运行时状态，跑在宿主机侧，handoff 时做一致性校验）。两者都在"墙外"供应、"墙内"使用。
-- ✅ 官方确认（架构图）：持久存储层为 **LUKS 加密**（`Persistent Storage → LUKS Encryption → filesystem mount`）。
-  这解释了实测中 `/dev/mapper/rv` 的命名 —— device-mapper 正是 LUKS 卷的典型形态。静态数据加密在块设备层完成，对容器透明。
+- ✅ 官方确认（架构图）+ 实测（10-01）：持久存储层为 **LUKS 加密**，`rv` 的 dm uuid 为 `CRYPT-LUKS2`。
+  静态数据加密在块设备层完成，对容器透明。另外两个 dm 设备：`opt_hatch` 为 `CRYPT-VERITY`（只读 + 完整性校验），
+  `root_overlay` 为 `CRYPT-PLAIN`（plain dm-crypt，🔍 很可能是 rootfs 写层的底座）。
+- ✅ rv 卷不止承载 home：`/data/resume`、`/data/os-intent`、`/data/apt-archives` 等子路径分别 bind 到 cell（见 verification-log.md §4）。
 - 💭 生产级要点：
   - btrfs 选型理由：子卷（天然按用户隔离）、快照（handoff/备份）、zstd 压缩（降成本）。
   - Postgres 存的应该是**高频、小粒度的运行时状态**（记忆索引、会话、spaces catalog），文件存**低频、大粒度**的用户数据 —— 经典的冷热分层。
@@ -186,6 +204,7 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 - ✅ 痕迹：`/run/hatch/resume/` 全套（epoch、marker、hotset.manifest、proof）；hotset 845 条目/61MB/tier1+tier2；02:15 撞见的一次 handoff（容器未重启）。
 - 🔍 强推断：宿主机侧有一个 warmer/handoff 编排器：定期或按需把 Postgres 热数据块读进 page cache、生成 manifest、推进 epoch。handoff 不一定伴随容器重建 —— 它是**独立的"世代"维度**。
 - ✅ 实测补充（2026-09-30）：VM 整台重建后 handoff-epoch 从 26 继续推进到 35 —— handoff 世代与"回收/重建"是**正交的两个维度**：回收杀的是机器，handoff 推进的是数据预热世代，重建后 epoch 不归零。
+  10-01 为 41。epoch 能接续是因为 `/run/hatch/resume` 本身就是 rv 卷 `/data/resume` 的 bind，不需要 VM 外部恢复。
 - 💭 生产级要点：这是整个架构里最精妙的一笔 —— 把"冷启动"重新定义为"带着预热缓存的苏醒"。61MB 的预热清单说明有人实测过"哪些块值得预热"，是数据驱动的优化，不是拍脑袋。
 
 ### 2.9 推理平面（模型在容器外）
@@ -237,9 +256,12 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 - **客户端是谁**：连接两端都在 cell 的 netns 表里 ⇒ `connect()` 发生在 cell netns 内 ——
   推理客户端是 host 侧**派驻进 cell netns 的 `hatch daemon`（PID 67，`ppid=0`，`--runtime-cell-leader=2134`）**。
   但它自己的 mount ns 里也没有 `proxy/`（mountinfo 可读，38 个 hatch 挂载、0 个含 proxy），
-  所以它靠 mount 视角之外的东西建连接：继承的 dirfd（经 `/proc/self/fd/<N>/inference.sock` 绕过 mount ns）
-  或 host 侧父进程代建后递 fd —— yama（`ptrace_scope=1`）挡住了 67 的 fd 表与 environ，最后一步无法直接证实，这本身也是设计的一部分。
-- **"只有持 fd 者能用"的完整形态**：path（bind 在 cell 看不见的 mount 视角）+ fd（yama 墙后）双保险。
+  所以它靠 mount 视角之外的东西建连接：继承的 dirfd（经 `/proc/self/fd/<N>/inference.sock` 绕过 mount ns）、
+  host 侧父进程代建后递 fd，或 VM 侧进程只加入 cell netns 直接连接 ——
+  内核 ptrace 访问检查（`PTRACE_MODE_READ`）挡住了 67 的 fd 表与 environ，最后一步无法直接证实，这本身也是设计的一部分。
+  （更正：初版归因于 yama `ptrace_scope=1`，但 yama 只限制 ptrace attach，不管 `/proc/<pid>/fd` 这类读取。）
+  另一个候选"daemon 的 `/run` 是另一份 tmpfs、`proxy/` 是其中的普通目录"已排除：两边 `/run` 设备号都是 `0:75`（10-01 实测）。
+- **"只有持 fd 者能用"的完整形态**：path（cell 的 mount 视角里不存在）+ fd（ptrace 访问检查墙后）双保险。
   cell 能看见连接存在（内核表按 netns 可见），但既连不上（ENOENT）也看不见持有者。
 
 一句话：推理通道是"看得见车、看不见司机、上不去车"的短连接池 —— 可观测性止于 netns 边界，能力止于 mount+yama 边界。
@@ -248,11 +270,11 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 
 | 决策 | 理由（💭） |
 |---|---|
-| 嵌套：KVM + nspawn | 一层给隔离（防逃逸影响整机），一层给速度（秒级按需）。单用任一层都不够 |
-| 按需容器 + 持久 home | 成本 vs 体验：2核/7G 常驻 per user 太贵；home 解耦后"销毁"不再可怕 |
+| 嵌套：KVM + nspawn | VM 隔离租户，cell 在同一台 VM 里把 agent 与凭证/策略服务隔开 —— 一台机器上的两个安全域 |
+| 按需 VM + 持久 rv 卷 | 成本 vs 体验：2核/7G 常驻 per user 太贵；状态全在 rv 卷上，整台 VM"销毁"不再可怕 |
 | 三态存储（btrfs 文件 + Postgres 状态 + 外部上下文） | 按访问模式分层：大粒度低频放文件、小粒度高频放 DB、会话放外部注入 |
 | 全出站 MITM 代理 + 审批 | DLP 与合规；策略运行时强制，不靠自觉 |
-| handoff + hotset 预热 | 把冷启动重新定义为"带缓存的苏醒"，13 秒是可接受的 UX 代价 |
+| handoff + hotset 预热 | 把冷启动重新定义为"带缓存的苏醒"；从 VM 内核算起约 33 秒可执行工具 |
 | 不可变配置（spawnd 渲染 + commit pin） | 可复现、可回滚、可审计；容器内不可改配置 |
 | 计算/数据分区（zas/rcd） | 延迟、合规、成本的 trade-off（细节未知） |
 | 推理在容器外 | 模型与沙箱独立演进、独立计费、独立扩缩容 |
@@ -279,12 +301,12 @@ Meta 官方发布了 [How We Built Safety Into Muse](https://research.meta.ai/bl
 
 2026-09 官方博客发布后，以下条目已有答案（划线），其余仍未知：
 
-1. 调度器：选机算法、pre-warm 水位、回收 idle 超时、超售比
+1. 调度器：选机算法、是否有通用预热快照、回收 idle 超时（只知下界）、超售比
 2. hotset 生成策略：触发条件、tier1/tier2 语义、刷新周期
 3. Postgres：主备形态、备份策略、schema（备份已确认"持续备份"，其余未知）
 4. 出站审批策略：什么要批、谁来批、延迟多少（tainted egress 机制已确认，策略细节未知）
 5. 入站面真实用途（ingress CA）
-6. 计算/数据分区的真实含义（zas/rcd）
+6. 计算/数据分区的真实含义（zas/rcd）：已知分别是 `JARVIS_VM_COMPUTE_REGION` 与 `JARVIS_VM_DATA_REGION` 的取值，对应哪个机房未知
 7. sentinel 的完整策略面
 8. ~~privsep 目录的真实用途~~ → ✅ 官方已答：cell 外的连接器沙箱 worker
 9. ~~VM 数据备份策略~~ → ✅ 官方已答：持续备份
